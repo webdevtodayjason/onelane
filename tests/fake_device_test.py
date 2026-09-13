@@ -366,6 +366,13 @@ def main():
     # (d) Different devices must not share a lock file. Stripping punctuation out of the
     #     host collided (192.0.2.177 and 192.0.21.77 both became 1920217), which
     #     silently serialised two unrelated Tiinys against each other.
+    #
+    #     These hosts do not exist, so the serial probe would spend its timeout on each
+    #     one before falling back to the address. Stub it out: what the probe does with
+    #     real hardware is checked separately, below and on a device.
+    real_serial = turnstile_mod._device_serial
+    turnstile_mod._device_serial = lambda addr, timeout=1.0, tries=2: None
+    turnstile_mod._IDENTITY.clear()
     one = OneLane(host="192.0.2.177", key="x")
     two = OneLane(host="192.0.21.77", key="x")
     check("different hosts get different locks", one._lock.path != two._lock.path,
@@ -384,6 +391,68 @@ def main():
     check("different ports on one device share a lock",
           OneLane(host="192.0.2.177", port=9098, key="x")._lock is one._lock,
           "one NPU, so they must queue together")
+
+    # (d2) The serial is the identity, not the address. A box's LAN address is a DHCP
+    #      lease and it moves, and the same box answers on its USB /30 as well, so two
+    #      apps reaching one device by two routes used to take out two lock files and
+    #      coordinate with nobody. Firmware 1.0 made that likely rather than theoretical.
+    print("")
+    SERIALS = {"192.0.2.10": "TNY-SAME", "192.0.2.11": "TNY-SAME",
+               "192.0.2.12": "TNY-OTHER"}
+    turnstile_mod._device_serial = \
+        lambda addr, timeout=1.0, tries=2: SERIALS.get(addr)
+    turnstile_mod._IDENTITY.clear()
+    lan = OneLane(host="192.0.2.10", key="x", port=80)     # the box on Wi-Fi
+    usb = OneLane(host="192.0.2.11", key="x", port=80)     # the same box over USB
+    other = OneLane(host="192.0.2.12", key="x", port=80)   # a different box
+    check("two addresses for one serial share a lock", lan._lock is usb._lock,
+          os.path.basename(lan._lock.path))
+    check("a second serial still gets its own lock", other._lock is not lan._lock,
+          os.path.basename(other._lock.path))
+    check("the serial, not the address, names the lock file",
+          "TNY-SAME" in os.path.basename(lan._lock.path))
+
+    # A process that cannot reach :39218 must land on the same lock as one that can,
+    # or the lock silently stops coordinating. That is what the shared serial file is
+    # for, and it is the whole reason this change is safe to make.
+    turnstile_mod._device_serial = lambda addr, timeout=1.0, tries=2: None
+    turnstile_mod._IDENTITY.clear()
+    blind = OneLane(host="192.0.2.10", key="x", port=80)
+    check("a failed probe reuses the serial another process published",
+          blind._lock is lan._lock, os.path.basename(blind._lock.path))
+
+    turnstile_mod._device_serial = real_serial
+    turnstile_mod._IDENTITY.clear()
+
+    # (d3) The address comes from the farm before it comes from TIINY_HOST, so an app
+    #      the farm planted needs no configuration.
+    farm = os.path.join(os.environ["ONELANE_DIR"], "farm-device.json")
+    with open(farm, "w") as fh:
+        json.dump({"base": "http://192.0.2.44:8800/v1", "key": "farm-key"}, fh)
+    saved_farm, saved_host, saved_key = (
+        turnstile_mod.FARM_DEVICE, os.environ.pop("TIINY_HOST", None),
+        os.environ.pop("TIINY_KEY", None))
+    try:
+        turnstile_mod.FARM_DEVICE = farm
+        host, port, key = turnstile_mod.device_from_env()
+        check("the farm's device file supplies host, port and key",
+              (host, port, key) == ("192.0.2.44", 8800, "farm-key"),
+              "%s:%s" % (host, port))
+        os.environ["TIINY_BASE"] = "http://192.0.2.55"
+        host, _p, _k = turnstile_mod.device_from_env()
+        check("TIINY_BASE wins over the farm's file", host == "192.0.2.55", host)
+        del os.environ["TIINY_BASE"]
+        os.environ["TIINY_HOST"] = "192.0.2.66"
+        host, _p, _k = turnstile_mod.device_from_env()
+        check("the farm's file wins over TIINY_HOST", host == "192.0.2.44", host)
+    finally:
+        turnstile_mod.FARM_DEVICE = saved_farm
+        os.environ.pop("TIINY_BASE", None)
+        os.environ.pop("TIINY_HOST", None)
+        if saved_host is not None:
+            os.environ["TIINY_HOST"] = saved_host
+        if saved_key is not None:
+            os.environ["TIINY_KEY"] = saved_key
 
     # (e) Binary responses must survive as bytes, and a declined image must raise
     #     rather than handing the caller a dict where a PNG was promised.

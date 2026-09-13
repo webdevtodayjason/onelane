@@ -27,6 +27,12 @@ WHAT IT DOES
   502/503/504 — with exponential backoff and jitter.
 * Optionally tracks the 100-unit model residency budget in a small shared ledger, so an
   application can ask "will my model fit?" before it evicts somebody else's.
+* Finds the device without being told: TIINY_BASE, then ~/.tiinyapps/device.json from
+  the farm, then TIINY_HOST. It then asks the box which port serves the gateway, because
+  1.0 firmware refuses 8800 from another machine and serves everything on 80 instead.
+* Names the lock file after the device's SERIAL NUMBER, not its address. An address is a
+  DHCP lease and the same box also answers on its USB /30, so two apps reaching one
+  device by two routes used to take out two locks and coordinate with nobody.
 
 WHAT IT DOES NOT DO
 -------------------
@@ -38,7 +44,7 @@ USAGE
 -----
     from onelane import OneLane
 
-    t = OneLane()                       # reads TIINY_HOST / TIINY_KEY
+    t = OneLane()                       # finds the device and the key by itself
 
     reply = t.chat("deepreinforce-ai/Ornith-1.0-35B",
                    [{"role": "user", "content": "Say hello"}])
@@ -67,10 +73,70 @@ import threading
 import types
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import weakref
 
-__all__ = ["OneLane", "DeviceBusy", "DeviceError", "Budget", "who"]
+__all__ = ["OneLane", "DeviceBusy", "DeviceError", "Budget", "who",
+           "device_from_env"]
+
+__version__ = "0.1.1"
+
+# Unauthenticated device metadata. The one endpoint that answers the same way on
+# every firmware and carries the serial number, which is the only name for a box
+# that does not change when its address does.
+DISCO_PORT = 39218
+
+# What the farm hands an app when it gives it a box: {"base": ..., "key": ...}.
+FARM_DEVICE = os.path.join(os.path.expanduser("~"), ".tiinyapps", "device.json")
+
+
+def _farm_device():
+    """What `farm device` wrote, or an empty dict."""
+    try:
+        with open(FARM_DEVICE, "rb") as fh:
+            got = json.load(fh)
+        return got if isinstance(got, dict) else {}
+    except Exception:  # noqa: BLE001 - absent or unreadable is just "nothing there"
+        return {}
+
+
+def _split_base(base):
+    """A base URL or a bare address as (host, explicit port or None).
+
+    Accepts what the farm and the environment actually contain: "1.2.3.4",
+    "http://1.2.3.4", "http://1.2.3.4:8800/v1", a hostname, or a hostname and a
+    port. We want the host on its own because this module builds its own URLs.
+    """
+    base = (base or "").strip()
+    if not base:
+        return None, None
+    if "//" not in base:
+        base = "http://" + base
+    try:
+        parts = urllib.parse.urlsplit(base)
+        return (parts.hostname or None), parts.port
+    except ValueError:
+        return None, None
+
+
+def device_from_env():
+    """(host, port, key) from the places a Tiiny's address is written down.
+
+    TIINY_BASE is what the farm CLI exports, ~/.tiinyapps/device.json is what
+    `farm device` writes, and TIINY_HOST is what this module documented before
+    either of those existed. All three still work, in that order, so an app
+    planted by the farm needs no configuration and an app that already sets
+    TIINY_HOST keeps working untouched.
+    """
+    key = (os.environ.get("TIINY_KEY") or _farm_device().get("key") or "").strip()
+    for value in (os.environ.get("TIINY_BASE"), _farm_device().get("base"),
+                  os.environ.get("TIINY_HOST")):
+        host, port = _split_base(value)
+        if host:
+            return host, port, key
+    return None, None, key
+
 
 def _gateway_port(host, timeout=2.0):
     """Which port serves the AI gateway on this device.
@@ -102,8 +168,9 @@ def _gateway_port(host, timeout=2.0):
     return 80
 
 
-# Kept as the historical fallback. Pass port= explicitly to pin it;
-# leave it None and the gateway is probed per host.
+# Where the gateway used to be, kept only so an old caller that imports it still
+# works. Nothing in this module reads it: leave port=None and the gateway is
+# probed per host, because 1.0 firmware refuses 8800 from another machine.
 DEFAULT_PORT = 8800
 NPU_TOTAL = 100
 
@@ -272,23 +339,117 @@ class DeviceError(RuntimeError):
 _IDENTITY = {}
 
 
-def _device_identity(host):
-    """Reduce however this host was spelled to one identity per device.
+def _serial_path():
+    """Where a learned serial is shared, beside the lock files it protects."""
+    return os.path.join(_default_lock_dir(), "onelane-serials.json")
 
-    'localhost' and '127.0.0.1' are the same Tiiny, but as raw strings they hash to two
-    lock files and coordinate with nobody — the silent failure again, the same shape as
-    the per-user temp directory. Resolving pins both to one address. When resolution
-    fails, the literal spelling is the honest fallback: over-serialising two names that
-    turn out to be one device only costs throughput, while under-serialising is a race.
+
+def _serial_known(addr):
+    """A serial another process already learned for this address, or None."""
+    try:
+        with open(_serial_path(), "rb") as fh:
+            got = json.load(fh)
+        value = got.get(addr) if isinstance(got, dict) else None
+        return value if isinstance(value, str) and value else None
+    except Exception:  # noqa: BLE001 - absent, unreadable or corrupt is just "no"
+        return None
+
+
+def _serial_remember(addr, serial):
+    """Publish addr -> serial where the other processes can read it.
+
+    This file is a safety net, not a source of truth. Without it, one process
+    that reached :39218 and one that did not would pick two different identities
+    for the same box and coordinate with nobody, which is precisely the silent
+    failure this module exists to prevent. Written atomically; every failure is
+    ignored, because being unable to cache is not a reason to stop working.
+    """
+    if _serial_known(addr) == serial:
+        return
+    try:
+        try:
+            with open(_serial_path(), "rb") as fh:
+                got = json.load(fh)
+            got = got if isinstance(got, dict) else {}
+        except Exception:  # noqa: BLE001
+            got = {}
+        got[addr] = serial
+        path = _serial_path()
+        fd, temporary = tempfile.mkstemp(prefix=".onelane-serials-",
+                                         dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(got, fh)
+            # Readable by every user sharing the device, writable only by us: a
+            # reader that cannot write simply re-probes.
+            os.chmod(temporary, 0o644)
+            os.replace(temporary, path)
+        except Exception:  # noqa: BLE001
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _device_serial(addr, timeout=1.0, tries=2):
+    """The serial number of the box at this address, or None.
+
+    :39218/device.json is unauthenticated and answers on every firmware, so this
+    costs one small request and needs no key. Tried twice, because a single blip
+    deciding the identity of a lock is not a trade worth making.
+    """
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(
+                    "http://%s:%d/device.json" % (addr, DISCO_PORT),
+                    timeout=timeout) as r:
+                got = json.load(r)
+            serial = got.get("serial_number") if isinstance(got, dict) else None
+            if isinstance(serial, str) and serial.strip():
+                return serial.strip()
+            return None
+        except Exception:  # noqa: BLE001
+            if attempt + 1 >= tries:
+                return None
+    return None
+
+
+def _device_identity(host):
+    """Reduce however this box was reached to one identity per device.
+
+    A lock coordinates only the processes that open the same file, so the name we
+    hash has to be one-to-one with the hardware. Two things break that:
+
+      * Spelling. 'localhost' and '127.0.0.1' are the same Tiiny, but as raw
+        strings they hash to two lock files and coordinate with nobody, the
+        silent failure again, the same shape as the per-user temp directory.
+      * The address itself. A box's LAN address is a DHCP lease and it moves, and
+        the same box answers on its USB /30 as well, so one device can present
+        three different addresses in a week. An address is not an identity.
+
+    So the serial number is the identity, read from :39218/device.json, and it is
+    published for the other processes so a probe that fails in one of them cannot
+    split the lock. Resolving the name pins the spellings together and is the
+    fallback when the box will not say who it is: over-serialising two names that
+    turn out to be one device only costs throughput, while under-serialising is a
+    race.
     """
     got = _IDENTITY.get(host)
     if got is None:
         # Case and a trailing root dot are not distinctions the device knows about.
         name = (host or "").strip().rstrip(".").lower() or "127.0.0.1"
         try:
-            got = socket.gethostbyname(name)
+            addr = socket.gethostbyname(name)
         except (socket.gaierror, UnicodeError, OSError):
-            got = name
+            addr = name
+        serial = _device_serial(addr)
+        if serial:
+            _serial_remember(addr, serial)
+        else:
+            serial = _serial_known(addr)
+        got = serial or addr
         _IDENTITY[host] = got
     return got
 
@@ -388,7 +549,7 @@ def who(host=None, port=None, lock_key=None, path=None):
     """
     if path is None:
         t = OneLane.__new__(OneLane)   # no connection, we only want the path
-        t.host = host or os.environ.get("TIINY_HOST") or "127.0.0.1"
+        t.host = host or device_from_env()[0] or "127.0.0.1"
         ident = lock_key or _device_identity(t.host)
         safe = "".join(c if c.isalnum() else "-" for c in ident).strip("-") or "device"
         key_id = "%s-%s" % (safe[:32], hashlib.sha1(ident.encode()).hexdigest()[:8])
@@ -808,12 +969,20 @@ class OneLane:
     def __init__(self, host=None, key=None, port=None,
                  tries=6, base_delay=2.0, max_delay=30.0, timeout=300.0,
                  on_wait=None, lock_key=None, settle_s=60.0, owner=None):
-        self.host = host or os.environ.get("TIINY_HOST") or "127.0.0.1"
-        self.key = key or os.environ.get("TIINY_KEY") or ""
-        # None means "work it out": 1.0.0 firmware serves the gateway on 80,
-        # older firmware on 8800. Pass port= explicitly to pin it.
+        env_host, env_port, env_key = device_from_env()
+        if host:
+            # An explicit host means an explicit box; a port left over in
+            # TIINY_BASE has nothing to do with it.
+            self.host, env_port = host, None
+        else:
+            self.host = env_host or "127.0.0.1"
+        self.key = key or env_key
+        # None means "work it out": 1.0 firmware serves the gateway on port 80
+        # behind a Host-header router and refuses 8800 from another machine,
+        # older firmware serves it on 8800. A port passed here, or carried in
+        # TIINY_BASE, pins it.
         if port is None:
-            port = _gateway_port(self.host)
+            port = env_port or _gateway_port(self.host)
         self.port = int(port)
         self.base = "http://%s:%d" % (self.host, self.port)
         self.tries = int(tries)

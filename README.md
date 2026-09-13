@@ -14,7 +14,7 @@ OneLane fixes that. Whichever app asks second just waits its turn instead of err
 ```python
 from onelane import OneLane
 
-lane = OneLane()                      # reads TIINY_HOST and TIINY_KEY
+lane = OneLane()                      # finds the device and the key by itself
 with lane.hold(why="bedtime story"):
     ...                               # your inference call goes here
 ```
@@ -76,12 +76,40 @@ python3 tests/fake_device_test.py
 
 There is also `verify-on-device.sh` if you want to prove it against your own Tiiny.
 
+## Finding the device
+
+`OneLane()` works out where the box is, so an app the farm planted needs no configuration:
+
+| Step | What it is |
+|---|---|
+| `TIINY_BASE` | what the farm CLI exports. A full URL is fine; a port in it pins the gateway port |
+| `~/.tiinyapps/device.json` | what `farm device` writes: `{"base": ..., "key": ...}` |
+| `TIINY_HOST` | the name this library documented first. Still honoured |
+
+Then it asks the box which port serves the gateway. Firmware 1.0 binds the gateway to the
+container bridge only, so port 8800 is refused from another machine and everything arrives
+on port 80. Old firmware still answers on 8800. Passing `port=` pins it and skips the probe.
+
+## One lock per device, named by serial number
+
+The lock file is named after the device's **serial number**, read from the unauthenticated
+`http://<addr>:39218/device.json`. Not its address: a LAN address is a DHCP lease and it
+moves, and the same box also answers on its USB `/30`, so two apps reaching one device by
+two routes used to take out two lock files and coordinate with nobody. That is the worst way
+for a lock to fail, and it is the reason this library exists.
+
+If the box will not say who it is, the resolved address is the fallback, and a serial another
+process already learned is published in `onelane-serials.json` beside the lock files so one
+failed probe cannot split the lock either.
+
 ## Settings
 
 | Variable | Default | What it does |
 |---|---|---|
-| `TIINY_HOST` | - | your Tiiny's address |
+| `TIINY_BASE` | - | your Tiiny's address or base URL |
+| `TIINY_HOST` | - | the same thing, older name |
 | `TIINY_KEY` | - | the API key from the Tiiny's settings |
+| `TIINY_PORT` | *probed* | pin the gateway port instead of asking the box |
 | `ONELANE_DIR` | `/tmp` | where the lock file lives. Set this if your apps run in containers or under `PrivateTmp` |
 | `ONELANE_STRICT` | unset | refuse to run at all if the lock cannot be shared, instead of warning |
 
