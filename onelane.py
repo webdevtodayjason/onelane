@@ -72,6 +72,38 @@ import weakref
 
 __all__ = ["OneLane", "DeviceBusy", "DeviceError", "Budget", "who"]
 
+def _gateway_port(host, timeout=2.0):
+    """Which port serves the AI gateway on this device.
+
+    Firmware 1.0.0 moved it. The gateway now binds 172.17.0.1:8800, the docker
+    bridge only, and serves the same surface on port 80. Older firmware keeps it
+    on 8800 and uses 80 for device management, so a plain TCP probe cannot tell
+    the two apart - port 80 answers on both. Asking for an AI route can: the
+    firmware that does not serve it 404s.
+
+    TIINY_PORT overrides, for anyone who has put it somewhere else.
+    """
+    env = os.environ.get("TIINY_PORT")
+    if env:
+        return int(env)
+    for port in (80, 8800):
+        try:
+            req = urllib.request.Request(
+                "http://%s:%d/v1/models" % (host, port),
+                headers={"Authorization": "Bearer probe"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if r.status != 404:
+                    return port
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:      # 401 still means the gateway is here
+                return port
+        except Exception:            # noqa: BLE001 - unreachable; try the next
+            continue
+    return 80
+
+
+# Kept as the historical fallback. Pass port= explicitly to pin it;
+# leave it None and the gateway is probed per host.
 DEFAULT_PORT = 8800
 NPU_TOTAL = 100
 
@@ -344,7 +376,7 @@ def _waiters_dir(lock_path):
     return lock_path + ".waiting"
 
 
-def who(host=None, port=DEFAULT_PORT, lock_key=None, path=None):
+def who(host=None, port=None, lock_key=None, path=None):
     """Who has the device right now, and who is queued behind them.
 
     Readers do not take the lock — they test it non-blockingly and read the record the
@@ -773,12 +805,17 @@ class Budget:
 # --------------------------------------------------------------------------- #
 
 class OneLane:
-    def __init__(self, host=None, key=None, port=DEFAULT_PORT,
+    def __init__(self, host=None, key=None, port=None,
                  tries=6, base_delay=2.0, max_delay=30.0, timeout=300.0,
                  on_wait=None, lock_key=None, settle_s=60.0, owner=None):
         self.host = host or os.environ.get("TIINY_HOST") or "127.0.0.1"
         self.key = key or os.environ.get("TIINY_KEY") or ""
-        self.base = "http://%s:%d" % (self.host, int(port))
+        # None means "work it out": 1.0.0 firmware serves the gateway on 80,
+        # older firmware on 8800. Pass port= explicitly to pin it.
+        if port is None:
+            port = _gateway_port(self.host)
+        self.port = int(port)
+        self.base = "http://%s:%d" % (self.host, self.port)
         self.tries = int(tries)
         self.base_delay = float(base_delay)
         self.max_delay = float(max_delay)
