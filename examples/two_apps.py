@@ -22,7 +22,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from onelane import OneLane, DeviceBusy  # noqa: E402
+from onelane import OneLane, DeviceBusy, device_from_env  # noqa: E402
 
 FAKE_PORT = 8899
 
@@ -80,7 +80,11 @@ def run_app(name, prompts, gap, coordinated, host, port):
 def main():
     fake = "--fake" in sys.argv
     coordinated = "--chaos" not in sys.argv
-    host, port = ("127.0.0.1", FAKE_PORT) if fake else (os.environ.get("TIINY_HOST", "127.0.0.1"), 8800)
+    # port None means "ask the device". Firmware 1.0 serves the gateway on 80
+    # behind a Host-header router and refuses 8800 from another machine, older
+    # firmware serves it on 8800, and OneLane works out which. Hardcoding 8800
+    # here is how this example stopped working on 1.0.
+    host, port = ("127.0.0.1", FAKE_PORT) if fake else (device_from_env()[0] or "127.0.0.1", None)
 
     srv = None
     if fake:
@@ -91,7 +95,9 @@ def main():
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         time.sleep(0.2)
 
-    print("device %s:%d   mode: %s\n" % (host, port, "TURNSTILE" if coordinated else "CHAOS (no coordination)"))
+    print("device %s%s   mode: %s\n" % (
+        host, ":%d" % port if port else " (gateway port found on connect)",
+        "TURNSTILE" if coordinated else "CHAOS (no coordination)"))
     me = os.path.abspath(__file__)
     common = ["--fake"] if fake else []
     if not coordinated:
@@ -114,7 +120,8 @@ if __name__ == "__main__":
     if "--child" in sys.argv:
         which = sys.argv[sys.argv.index("--child") + 1]
         fake = "--fake" in sys.argv
-        host, port = ("127.0.0.1", FAKE_PORT) if fake else (os.environ.get("TIINY_HOST", "127.0.0.1"), 8800)
+        host, port = (("127.0.0.1", FAKE_PORT) if fake
+                      else (device_from_env()[0] or "127.0.0.1", None))
         if which == "ticker":
             run_app("ticker", TICKER_PROMPTS, 1.0, "--chaos" not in sys.argv, host, port)
         else:
