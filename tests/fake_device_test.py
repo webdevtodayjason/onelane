@@ -8,13 +8,20 @@ inference at a time and answers 150004 to anything that overlaps. Then we point 
 worker PROCESSES at it, because in-process queuing is the easy half of the problem and
 testing only that would prove nothing.
 
+Those processes come from multiprocessing, not from subprocess. They used to be fresh
+interpreters started with subprocess, and tiinyapp.farm refuses an archive that contains
+subprocess at all. Nothing here ever needed to run a COMMAND; it needed a second Python
+process with its own open file descriptions and its own flock, and the "spawn" start
+method is exactly that. Plain os.fork() is not an option on macOS: the Objective-C
+runtime under the network stack aborts a forked child that has not exec'd.
+
 The suite includes a CONTROL that hammers the fake device without a onelane. If the
 control does not collide, the test is not measuring anything and says so.
 """
 
 import json
+import multiprocessing
 import os
-import subprocess
 import sys
 import tempfile
 import stat as _stat2
@@ -22,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -136,11 +144,145 @@ def stats():
 
 
 # --------------------------------------------------------------------------- #
-# the worker, re-entered as a subprocess
+# real child PROCESSES, forked rather than launched
 # --------------------------------------------------------------------------- #
 
-def _worker():
-    mode, calls = sys.argv[2], int(sys.argv[3])
+def _fork():
+    """os.fork(), with the multi-threaded warning silenced deliberately.
+
+    Only check (i) uses this, and only because inheriting the parent's lock
+    across fork is the thing that check is about. Its child reads two attributes,
+    tries one acquire and writes to a pipe, which is little enough to be safe in a
+    forked child. Anything that talks to the device gets a spawned process
+    instead: on macOS the Objective-C runtime under the network stack aborts a
+    forked child that has not exec'd.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return os.fork()
+
+
+# "spawn", not "fork": a fresh interpreter, which is what these workers used to be
+# when they were started through subprocess, and the only start method that is safe
+# on macOS once the network stack has been touched.
+_SPAWN = multiprocessing.get_context("spawn")
+
+
+def _child_main(send, work, args):
+    """In the child: run one function and post whatever it says back up the pipe."""
+    try:
+        work(_Post(send), *args)
+    except BaseException as exc:                      # reported, never raised
+        send.send("%s: %s" % (type(exc).__name__, exc))
+    finally:
+        send.close()
+
+
+class _Post:
+    """The `out` a worker writes to. One write, one message to the parent."""
+
+    def __init__(self, send):
+        self._send = send
+
+    def write(self, text):
+        self._send.send(text)
+
+    def flush(self):
+        pass
+
+
+class _Child:
+    """A separate PROCESS running one function, with a pipe back to the parent.
+
+    The function is called as work(out, *args) and writes its answer to `out`,
+    which is a pipe rather than stdout, so anything the child prints still lands
+    on the terminal for somebody reading the run while the parent gets a clean
+    answer.
+    """
+
+    def __init__(self, work, *args):
+        self._recv, send = _SPAWN.Pipe(duplex=False)
+        self._proc = _SPAWN.Process(target=_child_main, args=(send, work, args))
+        self._proc.start()
+        send.close()            # the parent's copy, or the pipe never reaches EOF
+        self._done = False
+
+    def line(self, timeout=30):
+        """The child's first message, for a handshake. It keeps running."""
+        if self._recv.poll(timeout):
+            try:
+                return self._recv.recv().strip()
+            except EOFError:
+                return ""
+        self.kill()
+        return ""
+
+    def read(self, timeout=180):
+        """Everything the child wrote, once it has finished."""
+        deadline = time.time() + timeout
+        parts = []
+        while True:
+            left = deadline - time.time()
+            if left <= 0 or not self._recv.poll(left):
+                self.kill()                       # wedged: fail the run, do not hang
+                break
+            try:
+                parts.append(self._recv.recv())
+            except EOFError:
+                break
+        self.wait()
+        return "".join(parts)
+
+    def kill(self):
+        self._proc.kill()
+        self.wait()
+
+    def wait(self):
+        if self._done:
+            return
+        self._done = True
+        self._proc.join(30)
+        self._recv.close()
+
+
+def _probe_lock(out, path):
+    """GOT or BLOCKED: can somebody who is not the holder take this lock?
+
+    It opens the file itself, which is the whole point. flock conflicts per OPEN
+    FILE DESCRIPTION, so a child that merely inherited the parent's descriptor
+    would see no contention at all, and an in-process OneLane would only re-test
+    threading.RLock -- it would pass with fcntl.flock deleted entirely, which is
+    exactly how this check once silently stopped proving anything.
+    """
+    import fcntl
+    with open(path, "a+") as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            out.write("GOT")
+        except OSError:
+            out.write("BLOCKED")
+
+
+def _hold_lock(out, path):
+    """Take the flock, say so, and sit on it until somebody kills this process."""
+    import fcntl
+    fh = open(path, "a+")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    out.write("held\n")
+    out.flush()
+    time.sleep(30)
+
+
+def _queue_behind(out, host, port, owner, why):
+    """Wait for the device from another process, so who() has a queue to report."""
+    lane = OneLane(host=host, port=port, key="x", owner=owner)
+    lane._lock.why = why
+    if lane._lock.acquire(timeout=3.0):
+        lane._lock.release()
+    out.write("done")
+
+
+def _worker(out, mode, calls):
     ok = err = 0
     if mode == "timeout":
         # Give up on the socket well before the device finishes. The device is still
@@ -151,7 +293,7 @@ def _worker():
             t.call("/v1/slow", {})
         except Exception:
             pass
-        print(json.dumps({"ok": 0, "err": 0}))
+        out.write(json.dumps({"ok": 0, "err": 0}))
         return
     if mode == "follower":
         time.sleep(0.25)          # arrive while the first worker is timing out
@@ -164,7 +306,7 @@ def _worker():
                 ok += 1
             except Exception:
                 err += 1
-        print(json.dumps({"ok": ok, "err": err}))
+        out.write(json.dumps({"ok": ok, "err": err}))
         return
     if mode == "onelane":
         t = OneLane(host=HOST, port=PORT, key="x", tries=8, base_delay=0.05, max_delay=0.4)
@@ -187,17 +329,27 @@ def _worker():
                 ok += 0 if body.get("code") == 150004 else 1
             except urllib.error.URLError:
                 err += 1
-    print(json.dumps({"ok": ok, "err": err}))
+    out.write(json.dumps({"ok": ok, "err": err}))
+
+
+def answer(kid, timeout=180):
+    """What a worker reported, or a visible failure if it never reported.
+
+    A child that dies before it can answer used to arrive as an IndexError out of
+    splitlines()[-1], which ends the run and says nothing about what happened.
+    Counting it as a failed call instead lets the check that asked for it fail in
+    its own words, and lets the rest of the suite run.
+    """
+    text = kid.read(timeout=timeout).strip()
+    if not text:
+        return {"ok": -1, "err": -1}
+    return json.loads(text.splitlines()[-1])
 
 
 def spawn(mode, procs, calls):
-    me = os.path.abspath(__file__)
-    running = [subprocess.Popen([sys.executable, me, "--worker", mode, str(calls)],
-                                stdout=subprocess.PIPE, text=True) for _ in range(procs)]
-    out = []
-    for p in running:
-        stdout, _ = p.communicate(timeout=180)
-        out.append(json.loads(stdout.strip().splitlines()[-1]))
+    """Start them all, then collect them, so they genuinely overlap."""
+    running = [_Child(_worker, mode, calls) for _ in range(procs)]
+    out = [answer(kid) for kid in running]
     return {"ok": sum(o["ok"] for o in out), "err": sum(o["err"] for o in out)}
 
 
@@ -272,35 +424,22 @@ def main():
     # threading.RLock -- it would pass with fcntl.flock deleted entirely, which is
     # exactly how this check silently stopped proving anything.
     lockpath = t._lock.path
-    OUTSIDER = ("import fcntl,sys\n"
-                "fh=open(sys.argv[1],'a+')\n"
-                "try:\n"
-                "  fcntl.flock(fh.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); print('GOT')\n"
-                "except OSError: print('BLOCKED')\n")
     with t.hold("a sequence"):
-        during = subprocess.run([sys.executable, "-c", OUTSIDER, lockpath],
-                                capture_output=True, text=True).stdout.strip()
+        during = _Child(_probe_lock, lockpath).read(timeout=30).strip()
         t.chat("fake/chat-35B", [{"role": "user", "content": "1"}])
         t.chat("fake/chat-35B", [{"role": "user", "content": "2"}])
-    after = subprocess.run([sys.executable, "-c", OUTSIDER, lockpath],
-                           capture_output=True, text=True).stdout.strip()
+    after = _Child(_probe_lock, lockpath).read(timeout=30).strip()
     check("another PROCESS is locked out during hold", during == "BLOCKED", during)
     check("and gets in once the hold ends", after == "GOT", after)
 
     # 6. A crashed holder must not wedge the device.
     print("\n-- crash: lock dies with the process that held it --")
     lockpath = t._lock.path
-    kid = subprocess.Popen([sys.executable, "-c",
-                            "import fcntl,sys,time\n"
-                            "fh=open(%r,'a+')\n" % lockpath +
-                            "fcntl.flock(fh.fileno(), fcntl.LOCK_EX)\n"
-                            "print('held', flush=True)\n"
-                            "time.sleep(30)\n"], stdout=subprocess.PIPE, text=True)
-    kid.stdout.readline()
+    kid = _Child(_hold_lock, lockpath)
+    kid.line()
     blocked = _CrossProcessLock(lockpath).acquire(timeout=0.3)
     check("a live holder blocks others", blocked is False)
     kid.kill()
-    kid.wait()
     freed = _CrossProcessLock(lockpath)
     check("killing the holder frees the device", freed.acquire(timeout=2.0) is True)
     freed.release()
@@ -486,13 +625,8 @@ def main():
     th2 = threading.Thread(target=thief)
     th2.start(); th2.join()
     # the owner must still hold it: a fresh process must still be locked out
-    probe = subprocess.run([sys.executable, "-c",
-                            "import fcntl,sys\n"
-                            "fh=open(%r,'a+')\n" % t._lock.path +
-                            "try:\n"
-                            "  fcntl.flock(fh.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); print('GOT')\n"
-                            "except OSError: print('BLOCKED')\n"], capture_output=True, text=True)
-    guard["still_held"] = "BLOCKED" in probe.stdout
+    probe = _Child(_probe_lock, t._lock.path).read(timeout=30).strip()
+    guard["still_held"] = probe == "BLOCKED"
     t._lock.release()
     check("non-owner release is refused", guard["raised"] is True)
     check("device stayed locked through the attempt", guard["still_held"] is True,
@@ -516,15 +650,8 @@ def main():
     #     in-flight inference. Without the fix this reproduces reliably.
     print("")
     DEV.peak = DEV.collisions = DEV.served = 0
-    me = os.path.abspath(__file__)
-    procs = [subprocess.Popen([sys.executable, me, "--worker", "timeout", "1"],
-                              stdout=subprocess.PIPE, text=True),
-             subprocess.Popen([sys.executable, me, "--worker", "follower", "1"],
-                              stdout=subprocess.PIPE, text=True)]
-    outs = []
-    for pr in procs:
-        so, _ = pr.communicate(timeout=180)
-        outs.append(json.loads(so.strip().splitlines()[-1]))
+    procs = [_Child(_worker, "timeout", 1), _Child(_worker, "follower", 1)]
+    outs = [answer(kid) for kid in procs]
     follower = outs[1]
     check("a peer is not let in while our request is still running",
           follower["err"] == 0 and follower["ok"] == 1,
@@ -537,7 +664,7 @@ def main():
     fl = _CrossProcessLock(os.path.join(os.path.dirname(t._lock.path), "onelane-forkcheck.lock"))
     fl.acquire()
     r, w = os.pipe()
-    kid = os.fork()
+    kid = _fork()
     if kid == 0:
         os.close(r)
         try:
@@ -552,8 +679,7 @@ def main():
     depth_s, owner_s, got_s = kid_msg.split("|")
     check("forked child does not inherit the lock", depth_s == "0" and owner_s == "None", kid_msg)
     check("forked child cannot take the held device", got_s == "False", kid_msg)
-    probe2 = subprocess.run([sys.executable, "-c", OUTSIDER, fl.path],
-                            capture_output=True, text=True).stdout.strip()
+    probe2 = _Child(_probe_lock, fl.path).read(timeout=30).strip()
     check("parent still holds it after the child exits", probe2 == "BLOCKED", probe2)
     fl.release()
 
@@ -639,17 +765,10 @@ def main():
     with holder.hold("enrich #1471"):
         w1 = turnstile_mod.who(host=HOST)
         # a second PROCESS queues behind it
-        WAITER = ("import os,sys,time\n"
-                  "sys.path.insert(0,%r)\n" % os.path.dirname(os.path.dirname(os.path.abspath(__file__))) +
-                  "os.environ['ONELANE_DIR']=%r\n" % os.environ["ONELANE_DIR"] +
-                  "import onelane as T\n"
-                  "t=T.OneLane(host=%r,port=%d,key='x',owner='reverie')\n" % (HOST, PORT) +
-                  "t._lock.why='painting'\n"
-                  "t._lock.acquire(timeout=3.0) and t._lock.release()\n")
-        kid2 = subprocess.Popen([sys.executable, "-c", WAITER])
+        kid2 = _Child(_queue_behind, HOST, PORT, "reverie", "painting")
         time.sleep(1.0)
         w2 = turnstile_mod.who(host=HOST)
-        kid2.wait(timeout=30)
+        kid2.read(timeout=30)
     w3 = turnstile_mod.who(host=HOST)
     check("who() names the holder", w1["held"] and w1["owner"] == "daybreak", str(w1["owner"]))
     check("who() carries what it is doing", w1["why"] == "enrich #1471", str(w1["why"]))
@@ -705,8 +824,7 @@ def main():
     check("a non-serialisable `why` cannot wedge the device",
           weird._lock._depth == 0 and weird._lock._fh is None,
           "depth=%s fh=%s" % (weird._lock._depth, weird._lock._fh))
-    probe3 = subprocess.run([sys.executable, "-c", OUTSIDER, weird._lock.path],
-                            capture_output=True, text=True).stdout.strip()
+    probe3 = _Child(_probe_lock, weird._lock.path).read(timeout=30).strip()
     check("and the device is still usable afterwards", probe3 == "GOT", probe3)
 
     # The waiter file lives in a world-writable directory under a guessable name, so a
@@ -847,7 +965,4 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
-        _worker()
-    else:
-        sys.exit(main())
+    sys.exit(main())

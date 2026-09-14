@@ -80,7 +80,7 @@ import weakref
 __all__ = ["OneLane", "DeviceBusy", "DeviceError", "Budget", "who",
            "device_from_env"]
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # Unauthenticated device metadata. The one endpoint that answers the same way on
 # every firmware and carries the serial number, which is the only name for a box

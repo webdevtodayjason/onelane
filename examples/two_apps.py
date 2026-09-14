@@ -12,12 +12,16 @@ share is a OneLane pointed at the same device. Run it and watch the interleaving
 the log: nobody waits long, nobody is refused, and the device is never asked to do two
 things at once.
 
+Each one is a multiprocessing "spawn" child: a fresh interpreter, which is what they
+need to be, and not a command run through subprocess. tiinyapp.farm refuses an archive
+that contains subprocess at all, and nothing here ever wanted to run a command.
+
 Run it once with `--chaos` to see what the same two programs look like without the
 onelane. That is the version people write first.
 """
 
+import multiprocessing
 import os
-import subprocess
 import sys
 import time
 
@@ -25,6 +29,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from onelane import OneLane, DeviceBusy, device_from_env  # noqa: E402
 
 FAKE_PORT = 8899
+
+# A fresh interpreter per application, which is the honest shape of "two apps".
+_SPAWN = multiprocessing.get_context("spawn")
 
 TICKER_PROMPTS = [
     "In one sentence, why do distributed systems need backpressure?",
@@ -98,16 +105,16 @@ def main():
     print("device %s%s   mode: %s\n" % (
         host, ":%d" % port if port else " (gateway port found on connect)",
         "TURNSTILE" if coordinated else "CHAOS (no coordination)"))
-    me = os.path.abspath(__file__)
-    common = ["--fake"] if fake else []
-    if not coordinated:
-        common.append("--chaos")
     kids = [
-        subprocess.Popen([sys.executable, me, "--child", "ticker"] + common),
-        subprocess.Popen([sys.executable, me, "--child", "story"] + common),
+        _SPAWN.Process(target=run_app,
+                       args=("ticker", TICKER_PROMPTS, 1.0, coordinated, host, port)),
+        _SPAWN.Process(target=run_app,
+                       args=("story", STORY_PROMPTS, 0.2, coordinated, host, port)),
     ]
-    for k in kids:
-        k.wait()
+    for kid in kids:
+        kid.start()
+    for kid in kids:
+        kid.join()
     if srv:
         srv.shutdown()
     print("\nBoth applications finished." if coordinated else
@@ -117,14 +124,4 @@ def main():
 START = time.time()
 
 if __name__ == "__main__":
-    if "--child" in sys.argv:
-        which = sys.argv[sys.argv.index("--child") + 1]
-        fake = "--fake" in sys.argv
-        host, port = (("127.0.0.1", FAKE_PORT) if fake
-                      else (device_from_env()[0] or "127.0.0.1", None))
-        if which == "ticker":
-            run_app("ticker", TICKER_PROMPTS, 1.0, "--chaos" not in sys.argv, host, port)
-        else:
-            run_app("story", STORY_PROMPTS, 0.2, "--chaos" not in sys.argv, host, port)
-    else:
-        main()
+    main()
